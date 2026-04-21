@@ -118,7 +118,9 @@ inline __device__ void compute_attn_kvcache_1rowblock(
                            make_coord(m_block));
 
     // --- KV cache tensors (indexed by n_block) ---
-    // Cache K:  base pointer for this (batch, head_k)
+    // The Python caller has already written knew/vnew into k_cache/v_cache at
+    // positions [cache_seqlen_b .. cache_seqlen_b+seqlen_knew-1].  So we only
+    // ever load from k_cache/v_cache, using total_seqlen_k as the valid length.
     const int h_k = bidh / h_h_k_ratio;
     const half_t* kcache_bh = kcache
         + (int64_t)bidb * kcache_batch_stride
@@ -127,53 +129,17 @@ inline __device__ void compute_attn_kvcache_1rowblock(
         + (int64_t)bidb * vcache_batch_stride
         + (int64_t)h_k  * vcache_head_stride;
 
-    // We build a fake "full" tensor over total_seqlen_k with the cache row stride.
-    // n_block < ceil(cache_seqlen_b / kBlockN)  → loads from cache
-    // n_block >= that threshold                  → loads from knew/vnew
-    const int n_cache_blocks = (cache_seqlen_b + kBlockN - 1) / kBlockN;
-
-    // Tensor views for cache K/V (rows 0..cache_seqlen_b-1)
     Tensor mKcache = make_tensor(make_gmem_ptr(kcache_bh),
-                                 make_shape(cache_seqlen_b, head_dim),
+                                 make_shape(total_seqlen_k, head_dim),
                                  make_stride(kcache_row_stride, Int<1>{}));
     Tensor gKcache = local_tile(mKcache, Shape<Int<kBlockN>, Int<kHeadDim>>{},
                                 make_coord(_, 0));
 
     Tensor mVcache = make_tensor(make_gmem_ptr(vcache_bh),
-                                 make_shape(cache_seqlen_b, head_dim),
+                                 make_shape(total_seqlen_k, head_dim),
                                  make_stride(vcache_row_stride, Int<1>{}));
     Tensor gVcache = local_tile(mVcache, Shape<Int<kBlockN>, Int<kHeadDim>>{},
                                 make_coord(_, 0));
-
-    // Tensor views for new K/V (rows 0..seqlen_knew-1)
-    const half_t* knew_bh  = (knew != nullptr)
-        ? knew  + (int64_t)bidb * knew_batch_stride  + (int64_t)h_k * knew_head_stride
-        : nullptr;
-    const half_t* vnew_bh  = (vnew != nullptr)
-        ? vnew  + (int64_t)bidb * vnew_batch_stride  + (int64_t)h_k * vnew_head_stride
-        : nullptr;
-
-    // new-token K tensor (only valid if seqlen_knew > 0)
-    // Shape (seqlen_knew, head_dim)
-    Tensor mKnew = (seqlen_knew > 0 && knew_bh != nullptr)
-        ? make_tensor(make_gmem_ptr(knew_bh),
-                      make_shape(seqlen_knew, head_dim),
-                      make_stride(knew_row_stride, Int<1>{}))
-        : make_tensor(make_gmem_ptr(static_cast<const half_t*>(nullptr)),
-                      make_shape(0, head_dim),
-                      make_stride(knew_row_stride, Int<1>{}));
-    Tensor gKnew = local_tile(mKnew, Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                              make_coord(_, 0));
-
-    Tensor mVnew = (seqlen_knew > 0 && vnew_bh != nullptr)
-        ? make_tensor(make_gmem_ptr(vnew_bh),
-                      make_shape(seqlen_knew, head_dim),
-                      make_stride(vnew_row_stride, Int<1>{}))
-        : make_tensor(make_gmem_ptr(static_cast<const half_t*>(nullptr)),
-                      make_shape(0, head_dim),
-                      make_stride(vnew_row_stride, Int<1>{}));
-    Tensor gVnew = local_tile(mVnew, Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                              make_coord(_, 0));
 
     // --- Shared memory ---
     extern __shared__ char smem_[];
@@ -268,10 +234,7 @@ inline __device__ void compute_attn_kvcache_1rowblock(
     auto tOrV_copy_view   = s2r_thr_copy_V.retile_D(tOrV);
 
     // --- Block bounds ---
-    // total_seqlen_k = cache_seqlen_b + seqlen_knew
-    // n_block indices: 0 .. n_block_max-1
-    //   blocks [0,            n_cache_blocks-1] → load from kcache/vcache
-    //   blocks [n_cache_blocks, n_block_max-1]  → load from knew/vnew
+    // All blocks [0 .. n_block_max-1] load from k_cache/v_cache (knew was pre-written in).
     // We iterate n_block from n_block_max-1 DOWN to 0 (newest first).
 
     const int n_block_min = 0;
@@ -302,44 +265,24 @@ inline __device__ void compute_attn_kvcache_1rowblock(
     clear(tOrO_float);
 
     // -----------------------------------------------------------------------
-    // Helper lambda: load K block into tKrK register fragment.
-    // n_block in [n_cache_blocks .. n_block_max-1] → knew
-    // n_block in [0            .. n_cache_blocks-1] → kcache
+    // Helper lambdas: load K/V block from k_cache/v_cache.
+    // knew/vnew have already been written into k_cache/v_cache by the caller.
+    // rows_left = valid rows remaining in this block (for boundary masking).
     // -----------------------------------------------------------------------
     auto load_k_block = [&](int nb, bool do_mask) {
-        if (nb >= n_cache_blocks) {
-            // load from knew
-            int nb_new = nb - n_cache_blocks;   // index into knew blocks
-            int rows_left = seqlen_knew - nb_new * kBlockN;
-            if (do_mask) {
-                masked_copy<false>(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKnew)(_, _, _, nb_new),
-                                   tKrK, warp_id, lane_id, rows_left, /*clear_D=*/true);
-            } else {
-                copy(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKnew)(_, _, _, nb_new), tKrK);
-            }
+        int rows_left = total_seqlen_k - nb * kBlockN;
+        if (do_mask) {
+            masked_copy<false>(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKcache)(_, _, _, nb),
+                               tKrK, warp_id, lane_id, rows_left, /*clear_D=*/true);
         } else {
-            // load from kcache
-            int rows_left = cache_seqlen_b - nb * kBlockN;
-            if (do_mask) {
-                masked_copy<false>(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKcache)(_, _, _, nb),
-                                   tKrK, warp_id, lane_id, rows_left, /*clear_D=*/true);
-            } else {
-                copy(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKcache)(_, _, _, nb), tKrK);
-            }
+            copy(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKcache)(_, _, _, nb), tKrK);
         }
     };
 
     auto load_v_block = [&](int nb) {
-        if (nb >= n_cache_blocks) {
-            int nb_new = nb - n_cache_blocks;
-            int rows_left = seqlen_knew - nb_new * kBlockN;
-            masked_copy<false>(gmem_tiled_copy_QK, thr_copy_V.partition_S(gVnew)(_, _, _, nb_new),
-                               tVsV, warp_id, lane_id, rows_left, /*clear_D=*/true);
-        } else {
-            int rows_left = cache_seqlen_b - nb * kBlockN;
-            masked_copy<false>(gmem_tiled_copy_QK, thr_copy_V.partition_S(gVcache)(_, _, _, nb),
-                               tVsV, warp_id, lane_id, rows_left, /*clear_D=*/true);
-        }
+        int rows_left = total_seqlen_k - nb * kBlockN;
+        masked_copy<false>(gmem_tiled_copy_QK, thr_copy_V.partition_S(gVcache)(_, _, _, nb),
+                           tVsV, warp_id, lane_id, rows_left, /*clear_D=*/true);
     };
 
     // Prologue: load Q block
