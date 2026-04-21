@@ -30,7 +30,9 @@ setup(
                      "csrc/flash_attn/src/flash_bwd_hdim64_fp16_sm75.cu",
                      "csrc/flash_attn/src/flash_bwd_hdim64_fp16_causal_sm75.cu",
                      "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm75.cu",
-                     "csrc/flash_attn/src/flash_bwd_hdim128_fp16_causal_sm75.cu"
+                     "csrc/flash_attn/src/flash_bwd_hdim128_fp16_causal_sm75.cu",
+                     "csrc/flash_attn/src/flash_fwd_hdim64_fp16_kvcache_sm75.cu",
+                     "csrc/flash_attn/src/flash_fwd_hdim128_fp16_kvcache_sm75.cu",
                      ],
             include_dirs=[
                 Path(this_dir) / "csrc" / "flash_attn",

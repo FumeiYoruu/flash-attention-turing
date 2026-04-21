@@ -20,6 +20,7 @@ from flash_attention_interface import (
     flash_attn_varlen_func,
     flash_attn_varlen_kvpacked_func,
     flash_attn_varlen_qkvpacked_func,
+    flash_attn_with_kvcache,
 )
 
 
@@ -1009,3 +1010,310 @@ def test_flash_attn_varlen_qkv(
         pairs=pairs,
     )
     _assert_metrics(bundle)
+
+
+# --------------------------------------------------------------------------------------
+# KV-cache inference tests
+# --------------------------------------------------------------------------------------
+
+# Tolerances for forward-only kvcache tests (fp16, compared against sdpa reference)
+KVCACHE_FWD_TOLS = dict(atol=5e-2, mean_atol=5e-3)
+
+# (cache_len, seqlen_q, seqlen_knew) triples.
+# seqlen_knew=0 means query-only (no new tokens appended).
+KVCACHE_SEQLEN_CASES: Sequence[Tuple[int, int, int]] = [
+    # Typical single-step decode (seqlen_q=1)
+    (0,   1, 1),    # first token: empty cache, append 1
+    (1,   1, 1),
+    (63,  1, 1),
+    (64,  1, 1),
+    (65,  1, 1),
+    (127, 1, 1),
+    (128, 1, 1),
+    (255, 1, 1),
+    (256, 1, 1),
+    (512, 1, 1),
+    (1023, 1, 1),
+    # Multi-token decode (seqlen_q > 1)
+    (0,   4, 4),
+    (64,  4, 4),
+    (128, 4, 4),
+    (64,  8, 8),
+    (128, 8, 8),
+    # Query-only (cache already written; seqlen_knew=0)
+    (64,  1, 0),
+    (128, 1, 0),
+    (128, 4, 0),
+    # Unaligned sizes that exercise masking paths
+    (63,  1, 0),
+    (65,  1, 0),
+    (127, 1, 0),
+    (129, 1, 0),
+    (63,  3, 3),
+    (65,  3, 3),
+    (127, 3, 3),
+    (129, 3, 3),
+]
+
+KVCACHE_NHEAD_PAIRS = [(4, 4), (4, 2), (4, 1)]   # (nheads_q, nheads_k)
+KVCACHE_HEAD_DIMS   = [64, 128]
+KVCACHE_BATCH_SIZES = [1, 2]
+
+
+def _kvcache_reference(
+    query: torch.Tensor,          # (B, seqlen_q, H, d)
+    k_full: torch.Tensor,         # (B, cache_len + seqlen_knew, H_k, d)
+    v_full: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """PyTorch SDPA over the full concatenated KV sequence — used as ground truth."""
+    (ref_out,) = vanilla_attention_ref(
+        query, k_full, v_full,
+        d_output=None,
+        causal=causal,
+        softmax_scale=softmax_scale,
+    )
+    return ref_out
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", KVCACHE_HEAD_DIMS)
+@pytest.mark.parametrize("batch_size", KVCACHE_BATCH_SIZES)
+@pytest.mark.parametrize("nheads, nheads_k", KVCACHE_NHEAD_PAIRS)
+@pytest.mark.parametrize("causal", CAUSAL_FLAGS)
+@pytest.mark.parametrize("softmax_scale", SOFTMAX_SCALES)
+@pytest.mark.parametrize("cache_len, seqlen_q, seqlen_knew", KVCACHE_SEQLEN_CASES)
+def test_flash_attn_kvcache(
+    batch_size: int,
+    nheads: int,
+    nheads_k: int,
+    cache_len: int,
+    seqlen_q: int,
+    seqlen_knew: int,
+    head_dim: int,
+    softmax_scale: Optional[float],
+    causal: bool,
+    dtype: torch.dtype,
+) -> None:
+    """
+    KV-cache forward pass must match vanilla SDPA over the full KV sequence.
+
+    The test constructs a full (cache + new) KV sequence, runs the reference,
+    then splits it into cache / new-tokens and runs flash_attn_with_kvcache.
+    """
+    device = _cuda_device()
+
+    scale = head_dim ** -0.5 if softmax_scale is None else softmax_scale
+    total_seqlen_k = cache_len + seqlen_knew
+
+    # Skip degenerate case: no keys at all
+    if total_seqlen_k == 0:
+        pytest.skip("no keys to attend over")
+
+    torch.manual_seed(42)
+    query  = torch.randn(batch_size, seqlen_q,       nheads,   head_dim, device=device, dtype=dtype)
+    k_full = torch.randn(batch_size, total_seqlen_k, nheads_k, head_dim, device=device, dtype=dtype)
+    v_full = torch.randn(batch_size, total_seqlen_k, nheads_k, head_dim, device=device, dtype=dtype)
+
+    # --- Reference ---
+    ref_out = _kvcache_reference(query, k_full, v_full, scale, causal)
+
+    # --- KV-cache path ---
+    # Pre-allocate cache large enough; fill the "already cached" portion.
+    max_cache_seqlen = total_seqlen_k + 64  # extra headroom
+    k_cache = torch.zeros(batch_size, max_cache_seqlen, nheads_k, head_dim, device=device, dtype=dtype)
+    v_cache = torch.zeros(batch_size, max_cache_seqlen, nheads_k, head_dim, device=device, dtype=dtype)
+
+    if cache_len > 0:
+        k_cache[:, :cache_len] = k_full[:, :cache_len]
+        v_cache[:, :cache_len] = v_full[:, :cache_len]
+
+    cache_seqlens = torch.full((batch_size,), cache_len, dtype=torch.int32, device=device)
+
+    k_new = k_full[:, cache_len:] if seqlen_knew > 0 else None
+    v_new = v_full[:, cache_len:] if seqlen_knew > 0 else None
+
+    flash_out = flash_attn_with_kvcache(
+        query, k_cache, v_cache, cache_seqlens,
+        k=k_new, v=v_new,
+        softmax_scale=scale,
+        causal=causal,
+    )
+    torch.cuda.synchronize()
+
+    metrics = _error_metrics(flash_out, ref_out)
+    print(
+        f"\n[kvcache] cache={cache_len} sq={seqlen_q} knew={seqlen_knew} "
+        f"causal={causal} d={head_dim} "
+        f"max_abs={metrics['max_abs']:.4f} mean_abs={metrics['mean_abs']:.6f}"
+    )
+
+    assert metrics["max_abs"]  <= KVCACHE_FWD_TOLS["atol"],      \
+        f"max_abs={metrics['max_abs']:.4f} > {KVCACHE_FWD_TOLS['atol']}"
+    assert metrics["mean_abs"] <= KVCACHE_FWD_TOLS["mean_atol"], \
+        f"mean_abs={metrics['mean_abs']:.6f} > {KVCACHE_FWD_TOLS['mean_atol']}"
+
+
+@pytest.mark.parametrize("head_dim", KVCACHE_HEAD_DIMS)
+@pytest.mark.parametrize("nheads, nheads_k", KVCACHE_NHEAD_PAIRS)
+def test_flash_attn_kvcache_ragged(
+    nheads: int,
+    nheads_k: int,
+    head_dim: int,
+) -> None:
+    """
+    Ragged cache: each batch element has a different number of cached tokens.
+    Verifies per-batch correctness against the SDPA reference.
+    """
+    device = _cuda_device()
+    dtype  = torch.float16
+    batch_size = 4
+    seqlen_q   = 1
+    seqlen_knew = 1
+    scale = head_dim ** -0.5
+
+    # Different cache lengths per batch
+    cache_lens = [0, 32, 64, 127]
+    assert len(cache_lens) == batch_size
+
+    max_cache = max(cache_lens) + seqlen_knew + 64
+
+    torch.manual_seed(7)
+    k_cache = torch.zeros(batch_size, max_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    v_cache = torch.zeros(batch_size, max_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    k_new   = torch.randn(batch_size, seqlen_knew, nheads_k, head_dim, device=device, dtype=dtype)
+    v_new   = torch.randn(batch_size, seqlen_knew, nheads_k, head_dim, device=device, dtype=dtype)
+    query   = torch.randn(batch_size, seqlen_q,    nheads,   head_dim, device=device, dtype=dtype)
+
+    # Fill cache for each batch element independently
+    ref_outs = []
+    for b, cl in enumerate(cache_lens):
+        k_cached_b = torch.randn(cl, nheads_k, head_dim, device=device, dtype=dtype)
+        v_cached_b = torch.randn(cl, nheads_k, head_dim, device=device, dtype=dtype)
+        k_cache[b, :cl] = k_cached_b
+        v_cache[b, :cl] = v_cached_b
+
+        k_full_b = torch.cat([k_cached_b, k_new[b]], dim=0).unsqueeze(0)  # (1, cl+knew, Hk, d)
+        v_full_b = torch.cat([v_cached_b, v_new[b]], dim=0).unsqueeze(0)
+        q_b      = query[b:b+1]
+
+        (ref_b,) = vanilla_attention_ref(q_b, k_full_b, v_full_b, causal=True, softmax_scale=scale)
+        ref_outs.append(ref_b)
+
+    ref_out = torch.cat(ref_outs, dim=0)  # (B, seqlen_q, H, d)
+
+    cache_seqlens = torch.tensor(cache_lens, dtype=torch.int32, device=device)
+    flash_out = flash_attn_with_kvcache(
+        query, k_cache, v_cache, cache_seqlens,
+        k=k_new, v=v_new,
+        softmax_scale=scale, causal=True,
+    )
+    torch.cuda.synchronize()
+
+    metrics = _error_metrics(flash_out, ref_out)
+    print(
+        f"\n[kvcache ragged] cache_lens={cache_lens} d={head_dim} "
+        f"max_abs={metrics['max_abs']:.4f} mean_abs={metrics['mean_abs']:.6f}"
+    )
+    assert metrics["max_abs"]  <= KVCACHE_FWD_TOLS["atol"],      f"max_abs={metrics['max_abs']:.4f}"
+    assert metrics["mean_abs"] <= KVCACHE_FWD_TOLS["mean_atol"], f"mean_abs={metrics['mean_abs']:.6f}"
+
+
+@pytest.mark.parametrize("head_dim", KVCACHE_HEAD_DIMS)
+def test_flash_attn_kvcache_cache_update(head_dim: int) -> None:
+    """
+    Verifies that new K/V tokens are actually written into the cache at the
+    correct positions (cache_seqlens[b] : cache_seqlens[b]+seqlen_knew).
+    """
+    device = _cuda_device()
+    dtype  = torch.float16
+    B, H, Hk = 2, 4, 4
+    cache_len   = 32
+    seqlen_knew = 4
+    max_cache   = cache_len + seqlen_knew + 16
+
+    torch.manual_seed(99)
+    k_cache = torch.zeros(B, max_cache, Hk, head_dim, device=device, dtype=dtype)
+    v_cache = torch.zeros(B, max_cache, Hk, head_dim, device=device, dtype=dtype)
+    k_new   = torch.randn(B, seqlen_knew, Hk, head_dim, device=device, dtype=dtype)
+    v_new   = torch.randn(B, seqlen_knew, Hk, head_dim, device=device, dtype=dtype)
+    query   = torch.randn(B, 1, H, head_dim, device=device, dtype=dtype)
+    cache_seqlens = torch.full((B,), cache_len, dtype=torch.int32, device=device)
+
+    # Snapshot before
+    k_cache_before = k_cache.clone()
+
+    flash_attn_with_kvcache(
+        query, k_cache, v_cache, cache_seqlens,
+        k=k_new, v=v_new, causal=True,
+    )
+    torch.cuda.synchronize()
+
+    # Positions [cache_len : cache_len+seqlen_knew] must now equal k_new / v_new
+    for b in range(B):
+        written_k = k_cache[b, cache_len:cache_len + seqlen_knew]
+        written_v = v_cache[b, cache_len:cache_len + seqlen_knew]
+        assert torch.allclose(written_k, k_new[b], atol=0), \
+            f"batch {b}: k_cache not updated correctly"
+        assert torch.allclose(written_v, v_new[b], atol=0), \
+            f"batch {b}: v_cache not updated correctly"
+
+    # Positions before cache_len must be unchanged (still zeros)
+    assert torch.allclose(k_cache[:, :cache_len], k_cache_before[:, :cache_len]), \
+        "positions before cache_len were corrupted"
+
+    print(f"\n[kvcache update] d={head_dim}: cache write verified OK")
+
+
+@pytest.mark.parametrize("head_dim", KVCACHE_HEAD_DIMS)
+def test_flash_attn_kvcache_multistep(head_dim: int) -> None:
+    """
+    Simulate multiple decode steps and check that each step's output matches
+    the SDPA reference computed over the growing KV context.
+    """
+    device = _cuda_device()
+    dtype  = torch.float16
+    B, H, Hk = 1, 4, 4
+    n_steps   = 8
+    max_cache = n_steps + 4
+    scale     = head_dim ** -0.5
+
+    torch.manual_seed(13)
+    k_cache = torch.zeros(B, max_cache, Hk, head_dim, device=device, dtype=dtype)
+    v_cache = torch.zeros(B, max_cache, Hk, head_dim, device=device, dtype=dtype)
+
+    # Keep a running log of all K/V for the reference
+    all_k: List[torch.Tensor] = []
+    all_v: List[torch.Tensor] = []
+
+    for step in range(n_steps):
+        q_step   = torch.randn(B, 1, H,  head_dim, device=device, dtype=dtype)
+        k_step   = torch.randn(B, 1, Hk, head_dim, device=device, dtype=dtype)
+        v_step   = torch.randn(B, 1, Hk, head_dim, device=device, dtype=dtype)
+
+        all_k.append(k_step[0, 0])
+        all_v.append(v_step[0, 0])
+
+        cache_seqlens = torch.tensor([step], dtype=torch.int32, device=device)
+
+        flash_out = flash_attn_with_kvcache(
+            q_step, k_cache, v_cache, cache_seqlens,
+            k=k_step, v=v_step, softmax_scale=scale, causal=True,
+        )
+        torch.cuda.synchronize()
+
+        # Reference: full SDPA over all tokens so far (including current)
+        k_full = torch.stack(all_k, dim=0).unsqueeze(0)   # (1, step+1, Hk, d)
+        v_full = torch.stack(all_v, dim=0).unsqueeze(0)
+        (ref_out,) = vanilla_attention_ref(q_step, k_full, v_full, causal=True, softmax_scale=scale)
+
+        metrics = _error_metrics(flash_out, ref_out)
+        print(
+            f"  step={step} max_abs={metrics['max_abs']:.4f} "
+            f"mean_abs={metrics['mean_abs']:.6f}"
+        )
+        assert metrics["max_abs"]  <= KVCACHE_FWD_TOLS["atol"],      \
+            f"step {step}: max_abs={metrics['max_abs']:.4f}"
+        assert metrics["mean_abs"] <= KVCACHE_FWD_TOLS["mean_atol"], \
+            f"step {step}: mean_abs={metrics['mean_abs']:.6f}"

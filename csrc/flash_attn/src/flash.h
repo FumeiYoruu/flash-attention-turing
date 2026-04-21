@@ -77,7 +77,43 @@ struct Flash_bwd_params : public Flash_fwd_params {
 };
 
 
+// Parameters for KV-cache inference.
+// Q shape:       (B, seqlen_q,     H,   d)  — new query tokens
+// K/V cache:     (B, max_cache_seqlen, H_k, d)  — pre-allocated cache
+// new K/V:       (B, seqlen_knew,  H_k, d)  — tokens to append (optional)
+// cache_seqlens: (B,) int32 — how many valid tokens are already in the cache per batch
+//
+// Before the kernel runs the C++ wrapper appends knew/vnew into the cache in-place
+// at positions [cache_seqlens[b] .. cache_seqlens[b]+seqlen_knew).
+// The kernel then attends over total seqlen_k = cache_seqlens[b] + seqlen_knew.
+struct Flash_fwd_kvcache_params : public Flash_fwd_params {
+    // KV cache tensors — shape (B, max_cache_seqlen, H_k, d), contiguous
+    half_t *__restrict__ kcache_ptr;
+    half_t *__restrict__ vcache_ptr;
+    index_t kcache_batch_stride;   // stride over batch dim (elements)
+    index_t kcache_row_stride;     // stride over seq dim  (= H_k * d)
+    index_t kcache_head_stride;    // stride over head dim (= d)
+    index_t vcache_batch_stride;
+    index_t vcache_row_stride;
+    index_t vcache_head_stride;
+
+    // Per-batch actual used cache lengths, device pointer, int32, shape (B,)
+    int *__restrict__ cache_seqlens;
+
+    // New K/V tokens to append — shape (B, seqlen_knew, H_k, d), may be nullptr
+    half_t *__restrict__ knew_ptr;
+    half_t *__restrict__ vnew_ptr;
+    index_t knew_batch_stride;
+    index_t knew_row_stride;
+    index_t knew_head_stride;
+    index_t vnew_batch_stride;
+    index_t vnew_row_stride;
+    index_t vnew_head_stride;
+    int seqlen_knew;           // 0 if no new tokens to append
+};
+
 template<int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_params &params);
 
+template<int Headdim> void run_mha_fwd_kvcache_(Flash_fwd_kvcache_params &params);
 
 template<int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params);

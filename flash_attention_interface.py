@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import flash_attn_turing as flash_attn_gpu
 import torch
+import math
 
 
 def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -553,3 +554,77 @@ def flash_attn_varlen_kvpacked_func(
         causal,
         torch.is_grad_enabled(),
     )
+
+
+def flash_attn_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+) -> torch.Tensor:
+    """
+    KV-cache inference: attend over a pre-filled KV cache plus optional new tokens.
+
+    Arguments:
+        q:             (B, seqlen_q, H, d)              float16 — new query tokens.
+        k_cache:       (B, max_cache_seqlen, H_k, d)    float16 — mutable KV cache.
+        v_cache:       (B, max_cache_seqlen, H_k, d)    float16 — mutable KV cache.
+        cache_seqlens: (B,)                              int32   — number of valid cached
+                           tokens per batch element (before this step).
+        k:             (B, seqlen_knew, H_k, d)         float16 — new key tokens to append
+                           into the cache (optional). If provided, they are written into
+                           k_cache at positions [cache_seqlens[b] : cache_seqlens[b]+seqlen_knew].
+        v:             (B, seqlen_knew, H_k, d)         float16 — new value tokens (paired with k).
+        softmax_scale: float. Defaults to 1/sqrt(d).
+        causal:        bool. Whether to apply causal masking (default True for inference).
+
+    Returns:
+        out: (B, seqlen_q, H, d) float16 — attention output for the new queries.
+
+    Notes:
+        - The cache tensors are updated IN-PLACE when k/v are provided.
+        - Supports GQA/MQA: H must be divisible by H_k.
+        - head_dim must be 64 or 128.
+        - All tensors must reside on the same CUDA device and be float16.
+    """
+    assert q.dtype == torch.float16, "q must be float16"
+    assert k_cache.dtype == torch.float16, "k_cache must be float16"
+    assert v_cache.dtype == torch.float16, "v_cache must be float16"
+
+    softmax_scale = softmax_scale or (q.shape[-1] ** -0.5)
+
+    seqlen_knew = k.shape[1] if k is not None else 0
+
+    # Append new K/V into the cache in-place before launching the kernel.
+    # For each batch element b, write k[b] -> k_cache[b, cache_seqlens[b]:cache_seqlens[b]+seqlen_knew].
+    # We use a vectorised scatter because the offsets differ per batch.
+    if k is not None and v is not None and seqlen_knew > 0:
+        batch_size = q.shape[0]
+        # cache_seqlens is on device; bring to CPU for the Python loop (small B).
+        offsets = cache_seqlens.cpu().tolist()
+        for b in range(batch_size):
+            start = offsets[b]
+            end = start + seqlen_knew
+            k_cache[b, start:end] = k[b]
+            v_cache[b, start:end] = v[b]
+
+    # Ensure contiguity for the cache tensors after the in-place update.
+    q        = maybe_contiguous(q)
+    k_cache  = maybe_contiguous(k_cache)
+    v_cache  = maybe_contiguous(v_cache)
+
+    out, _lse = flash_attn_gpu.fwd_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens,
+        k,          # passed so kernel knows seqlen_knew for grid sizing
+        v,
+        softmax_scale,
+        causal,
+    )
+    return out
