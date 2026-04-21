@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
-import torch.nn.functional as F
 
 from flash_attention_interface import (
     flash_attn_func,
@@ -316,9 +315,10 @@ def vanilla_attention_ref(
 ) -> Tuple[torch.Tensor, ...]:
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
-    query_torch = (query * softmax_scale).permute(0, 2, 1, 3).contiguous().clone().requires_grad_(True)
-    key_torch = key.permute(0, 2, 1, 3).contiguous().clone().requires_grad_(True)
-    value_torch = value.permute(0, 2, 1, 3).contiguous().clone().requires_grad_(True)
+    # Use float32 for reference stability; keep inputs as-is for autograd.
+    query_torch = query.permute(0, 2, 1, 3).contiguous().clone().to(torch.float32).requires_grad_(True)
+    key_torch   = key.permute(0, 2, 1, 3).contiguous().clone().to(torch.float32).requires_grad_(True)
+    value_torch = value.permute(0, 2, 1, 3).contiguous().clone().to(torch.float32).requires_grad_(True)
 
     nheads_q = query_torch.size(1)
     nheads_k = key_torch.size(1)
@@ -333,26 +333,19 @@ def vanilla_attention_ref(
     seqlen_q = query_torch.size(2)
     seqlen_k = key_torch.size(2)
 
-    is_causal = False
-    attn_mask = None
+    # Manual attention: scores (B, H, Sq, Sk) with explicit softmax_scale.
+    scores = torch.einsum("bhqd,bhkd->bhqk", query_torch, key_torch) * softmax_scale
     if causal:
-        if seqlen_q == seqlen_k:
-            is_causal = True
-        else:
-            attn_mask = causal_lower_right(seqlen_q, seqlen_k, device=query_torch.device)
+        attn_mask = causal_lower_right(seqlen_q, seqlen_k, device=query_torch.device)
+        scores = scores.masked_fill(~attn_mask, float("-inf"))
+    attn_weights = torch.softmax(scores, dim=-1)
+    output_torch = torch.einsum("bhqk,bhkd->bhqd", attn_weights, value_torch)
 
-    output_torch = F.scaled_dot_product_attention(
-        query_torch,
-        key_torch,
-        value_torch,
-        attn_mask=attn_mask,
-        is_causal=is_causal,
-    )
-
+    out_dtype = query.dtype
     if d_output is None:
-        return (output_torch.permute(0, 2, 1, 3).contiguous(),)
+        return (output_torch.to(out_dtype).permute(0, 2, 1, 3).contiguous(),)
 
-    d_output_torch = d_output.permute(0, 2, 1, 3).contiguous()
+    d_output_torch = d_output.to(torch.float32).permute(0, 2, 1, 3).contiguous()
     d_query_torch, d_key_torch, d_value_torch = torch.autograd.grad(
         outputs=output_torch,
         inputs=(query_torch, key_torch, value_torch),
@@ -368,10 +361,10 @@ def vanilla_attention_ref(
         d_value_torch = d_value_torch.view(d_value_torch.size(0), nheads_k, ratio, d_value_torch.size(2), d_value_torch.size(3)).sum(dim=2)
 
     return (
-        output_torch.permute(0, 2, 1, 3).contiguous(),
-        d_query_torch.permute(0, 2, 1, 3).contiguous(),
-        d_key_torch.permute(0, 2, 1, 3).contiguous(),
-        d_value_torch.permute(0, 2, 1, 3).contiguous(),
+        output_torch.to(out_dtype).permute(0, 2, 1, 3).contiguous(),
+        d_query_torch.to(out_dtype).permute(0, 2, 1, 3).contiguous(),
+        d_key_torch.to(out_dtype).permute(0, 2, 1, 3).contiguous(),
+        d_value_torch.to(out_dtype).permute(0, 2, 1, 3).contiguous(),
     )
 
 

@@ -275,13 +275,15 @@ inline __device__ void compute_attn_kvcache_1rowblock(
     // We iterate n_block from n_block_max-1 DOWN to 0 (newest first).
 
     const int n_block_min = 0;
-    int n_block_max = (total_seqlen_k + kBlockN - 1) / kBlockN;
+    const int n_block_max_kv = (total_seqlen_k + kBlockN - 1) / kBlockN;
+    int n_block_max = n_block_max_kv;
 
     // Causal: restrict n_block_max so earlier rows don't attend to future keys
     int causal_offset   = 0;
     int is_even_mn_offset = 0;
     if constexpr (Is_causal) {
-        n_block_max = max(0, (int)ceil_div((m_block + 1) * kBlockM + total_seqlen_k - seqlen_q, kBlockN));
+        n_block_max = min(n_block_max_kv,
+                         max(0, (int)ceil_div((m_block + 1) * kBlockM + total_seqlen_k - seqlen_q, kBlockN)));
         causal_offset = total_seqlen_k - seqlen_q - (n_block_max - 1) * kBlockN + m_block * kBlockM;
     }
     is_even_mn_offset = total_seqlen_k - (n_block_max - 1) * kBlockN;
