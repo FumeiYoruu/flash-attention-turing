@@ -310,8 +310,8 @@ inline __device__ void compute_attn_kvcache_1rowblock(
             int nb_new = nb - n_cache_blocks;   // index into knew blocks
             int rows_left = seqlen_knew - nb_new * kBlockN;
             if (do_mask) {
-                masked_copy<true>(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKnew)(_, _, _, nb_new),
-                                  tKrK, warp_id, lane_id, rows_left, /*clear_D=*/true);
+                masked_copy<false>(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKnew)(_, _, _, nb_new),
+                                   tKrK, warp_id, lane_id, rows_left, /*clear_D=*/true);
             } else {
                 copy(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKnew)(_, _, _, nb_new), tKrK);
             }
@@ -319,8 +319,8 @@ inline __device__ void compute_attn_kvcache_1rowblock(
             // load from kcache
             int rows_left = cache_seqlen_b - nb * kBlockN;
             if (do_mask) {
-                masked_copy<true>(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKcache)(_, _, _, nb),
-                                  tKrK, warp_id, lane_id, rows_left, /*clear_D=*/true);
+                masked_copy<false>(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKcache)(_, _, _, nb),
+                                   tKrK, warp_id, lane_id, rows_left, /*clear_D=*/true);
             } else {
                 copy(gmem_tiled_copy_QK, thr_copy_QK.partition_S(gKcache)(_, _, _, nb), tKrK);
             }
@@ -331,12 +331,12 @@ inline __device__ void compute_attn_kvcache_1rowblock(
         if (nb >= n_cache_blocks) {
             int nb_new = nb - n_cache_blocks;
             int rows_left = seqlen_knew - nb_new * kBlockN;
-            masked_copy<true>(gmem_tiled_copy_QK, thr_copy_V.partition_S(gVnew)(_, _, _, nb_new),
-                              tVsV, warp_id, lane_id, rows_left, /*clear_D=*/true);
+            masked_copy<false>(gmem_tiled_copy_QK, thr_copy_V.partition_S(gVnew)(_, _, _, nb_new),
+                               tVsV, warp_id, lane_id, rows_left, /*clear_D=*/true);
         } else {
             int rows_left = cache_seqlen_b - nb * kBlockN;
-            masked_copy<true>(gmem_tiled_copy_QK, thr_copy_V.partition_S(gVcache)(_, _, _, nb),
-                              tVsV, warp_id, lane_id, rows_left, /*clear_D=*/true);
+            masked_copy<false>(gmem_tiled_copy_QK, thr_copy_V.partition_S(gVcache)(_, _, _, nb),
+                               tVsV, warp_id, lane_id, rows_left, /*clear_D=*/true);
         }
     };
 
