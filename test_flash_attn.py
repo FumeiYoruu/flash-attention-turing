@@ -321,7 +321,12 @@ def vanilla_attention_ref(
     nheads_q = query_torch.size(1)
     nheads_k = key_torch.size(1)
     assert nheads_q % nheads_k == 0, "nheads_q must be divisible by nheads_k"
-    enable_gqa = nheads_q != nheads_k
+
+    # Expand K/V heads to match Q heads for GQA/MQA — works on all PyTorch versions.
+    if nheads_q != nheads_k:
+        ratio = nheads_q // nheads_k
+        key_torch   = key_torch.repeat_interleave(ratio, dim=1)
+        value_torch = value_torch.repeat_interleave(ratio, dim=1)
 
     seqlen_q = query_torch.size(2)
     seqlen_k = key_torch.size(2)
@@ -340,7 +345,6 @@ def vanilla_attention_ref(
         value_torch,
         attn_mask=attn_mask,
         is_causal=is_causal,
-        enable_gqa=enable_gqa,
         scale=softmax_scale,
     )
 
@@ -355,6 +359,12 @@ def vanilla_attention_ref(
         retain_graph=False,
         allow_unused=False,
     )
+
+    # If K/V were expanded for GQA, sum gradients back to original nheads_k.
+    if nheads_q != nheads_k:
+        ratio = nheads_q // nheads_k
+        d_key_torch   = d_key_torch.view(d_key_torch.size(0), nheads_k, ratio, d_key_torch.size(2), d_key_torch.size(3)).sum(dim=2)
+        d_value_torch = d_value_torch.view(d_value_torch.size(0), nheads_k, ratio, d_value_torch.size(2), d_value_torch.size(3)).sum(dim=2)
 
     return (
         output_torch.permute(0, 2, 1, 3).contiguous(),
