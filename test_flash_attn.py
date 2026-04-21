@@ -314,7 +314,9 @@ def vanilla_attention_ref(
     causal: bool = False,
     softmax_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, ...]:
-    query_torch = query.permute(0, 2, 1, 3).contiguous().clone().requires_grad_(True)
+    if softmax_scale is None:
+        softmax_scale = query.shape[-1] ** -0.5
+    query_torch = (query * softmax_scale).permute(0, 2, 1, 3).contiguous().clone().requires_grad_(True)
     key_torch = key.permute(0, 2, 1, 3).contiguous().clone().requires_grad_(True)
     value_torch = value.permute(0, 2, 1, 3).contiguous().clone().requires_grad_(True)
 
@@ -345,7 +347,6 @@ def vanilla_attention_ref(
         value_torch,
         attn_mask=attn_mask,
         is_causal=is_causal,
-        scale=softmax_scale,
     )
 
     if d_output is None:
