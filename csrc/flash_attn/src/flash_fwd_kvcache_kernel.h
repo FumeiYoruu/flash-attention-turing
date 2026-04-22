@@ -281,7 +281,7 @@ inline __device__ void compute_attn_kvcache_1rowblock(
 
     auto load_v_block = [&](int nb) {
         int rows_left = total_seqlen_k - nb * kBlockN;
-        masked_copy<false>(gmem_tiled_copy_QK, thr_copy_V.partition_S(gVcache)(_, _, _, nb),
+        masked_copy<false>(gmem_tiled_copy_V, thr_copy_V.partition_S(gVcache)(_, _, _, nb),
                            tVsV, warp_id, lane_id, rows_left, /*clear_D=*/true);
     };
 
@@ -326,6 +326,22 @@ inline __device__ void compute_attn_kvcache_1rowblock(
 
         accum_s_mask.template apply_mask_fwd<Is_causal, Is_even_MN>(
             tSrS_float, warp_id, lane_id, kBlockN, causal_offset, is_even_mn_offset);
+
+        // Mask out padding query rows (rows >= seqlen_q) so their zero-Q scores
+        // don't corrupt the shared softmax normalizer rM/rL.
+        // Fragment layout: ((_2,_2), _1, MMA_N) — outer _2 = col parity (i),
+        // inner _2 = row group (j=0 → thread_row, j=1 → thread_row+8).
+        CUTE_UNROLL
+        for (int i = 0; i < 2; i++) {
+            CUTE_UNROLL
+            for (int k = 0; k < size<1>(tSrS_float); k++) {
+                CUTE_UNROLL
+                for (int l = 0; l < size<2>(tSrS_float); l++) {
+                    if (global_row_offset + thread_row     >= seqlen_q) tSrS_float(make_coord(i,0),k,l) = -FLT_MAX;
+                    if (global_row_offset + thread_row + 8 >= seqlen_q) tSrS_float(make_coord(i,1),k,l) = -FLT_MAX;
+                }
+            }
+        }
 
         // online softmax
         for (int i = 0; i < 2; i++) { rM[i] = rM_old[i]; }
@@ -423,6 +439,19 @@ inline __device__ void compute_attn_kvcache_1rowblock(
 
         for (int i = 0; i < tSrS_float.size(); i++) {
             tSrS_float[i] *= softmax_scale;
+        }
+
+        // Mask out padding query rows (rows >= seqlen_q).
+        CUTE_UNROLL
+        for (int i = 0; i < 2; i++) {
+            CUTE_UNROLL
+            for (int k = 0; k < size<1>(tSrS_float); k++) {
+                CUTE_UNROLL
+                for (int l = 0; l < size<2>(tSrS_float); l++) {
+                    if (global_row_offset + thread_row     >= seqlen_q) tSrS_float(make_coord(i,0),k,l) = -FLT_MAX;
+                    if (global_row_offset + thread_row + 8 >= seqlen_q) tSrS_float(make_coord(i,1),k,l) = -FLT_MAX;
+                }
+            }
         }
 
         for (int i = 0; i < 2; i++) { rM[i] = rM_old[i]; }
