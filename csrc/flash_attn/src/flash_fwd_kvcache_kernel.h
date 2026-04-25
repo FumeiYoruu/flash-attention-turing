@@ -524,6 +524,13 @@ inline __device__ void compute_attn_kvcache_1rowblock(
     // -----------------------------------------------------------------------
     // Epilogue: normalise O, write to gmem, write LSE
     // -----------------------------------------------------------------------
+    // Debug: print rM/rL for thread 0 of warp 0
+    if (warp_id == 0 && lane_id == 0 && bidb == 0 && bidh == 0) {
+        printf("[kvcache dbg] bidb=%d bidh=%d m_block=%d n_block_max=%d "
+               "rM[0]=%f rM[1]=%f rL[0]=%f rL[1]=%f\n",
+               bidb, bidh, m_block, n_block_max,
+               rM[0], rM[1], rL[0], rL[1]);
+    }
     for (int i = 0; i < 2; i++) {
         if (rL[i] != 0.0f) {
             for (int j = 0; j < tOrO_float(make_coord(_, i), _, _).size(); j++) {
