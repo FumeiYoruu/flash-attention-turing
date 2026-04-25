@@ -373,6 +373,9 @@ def main() -> None:
         sweep_summaries = []
         split_values = list(range(0, max(args.split_max, 1) + 1))
         for case in cases:
+            if case.has_batch_idx:
+                print(f"{case.name}: skipped (cache_batch_idx not supported)")
+                continue
             summary = run_split_sweep(
                 case,
                 warmup=args.warmup,
@@ -405,6 +408,9 @@ def main() -> None:
                 )
     else:
         for case in cases:
+            if case.has_batch_idx:
+                print(f"{case.name}: skipped (cache_batch_idx not supported)")
+                continue
             run_case(case, warmup=args.warmup, repeats=args.repeats, dtype=dtype, device=device, num_splits=0)
 
 
