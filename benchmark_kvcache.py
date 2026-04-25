@@ -76,12 +76,11 @@ def reference_attention(
             else:
                 attn_mask = causal_lower_right(q_i.shape[2], k_i.shape[2], q.device)
         out_i = F.scaled_dot_product_attention(
-            q_i,
+            q_i * softmax_scale * (q_i.shape[-1] ** 0.5),  # pre-apply custom scale (scale= requires PyTorch >= 2.1)
             k_i,
             v_i,
             attn_mask=attn_mask,
             is_causal=is_causal,
-            scale=softmax_scale,
         )
         outputs.append(out_i.permute(0, 2, 1, 3).contiguous())
     return torch.cat(outputs, dim=0)
