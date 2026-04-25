@@ -63,6 +63,11 @@ def reference_attention(
         q_i = q[batch_idx : batch_idx + 1].permute(0, 2, 1, 3).contiguous()
         k_i = k_cache[batch_idx : batch_idx + 1, :seqlen_k].permute(0, 2, 1, 3).contiguous()
         v_i = v_cache[batch_idx : batch_idx + 1, :seqlen_k].permute(0, 2, 1, 3).contiguous()
+        # Expand K/V heads to match Q for GQA (replaces enable_gqa which requires PyTorch >= 2.1)
+        if q_i.shape[1] != k_i.shape[1]:
+            repeat = q_i.shape[1] // k_i.shape[1]
+            k_i = k_i.repeat_interleave(repeat, dim=1)
+            v_i = v_i.repeat_interleave(repeat, dim=1)
         attn_mask = None
         is_causal = False
         if causal:
@@ -76,7 +81,6 @@ def reference_attention(
             v_i,
             attn_mask=attn_mask,
             is_causal=is_causal,
-            enable_gqa=q_i.shape[1] != k_i.shape[1],
             scale=softmax_scale,
         )
         outputs.append(out_i.permute(0, 2, 1, 3).contiguous())
