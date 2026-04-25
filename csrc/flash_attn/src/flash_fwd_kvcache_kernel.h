@@ -469,14 +469,17 @@ inline __device__ void compute_attn_kvcache_1rowblock(
             rM[i] = __shfl_sync(mask, rM[i], lane_id_to_read_from);
         }
 
-        CUTE_UNROLL
         for (int i = 0; i < 2; i++) {
-            CUTE_UNROLL
             for (int j = 0; j < tSrS_float(make_coord(_, i), _, _).size(); j++) {
-                tSrS_float(make_coord(_, i), _, _)[j] =
-                    expf(tSrS_float(make_coord(_, i), _, _)[j] - rM[i]);
+                if (rM[i] == -FLT_MAX) {
+                    tSrS_float(make_coord(_, i), _, _)[j] = 0.0f;
+                } else {
+                    tSrS_float(make_coord(_, i), _, _)[j] =
+                        expf(tSrS_float(make_coord(_, i), _, _)[j] - rM[i]);
+                }
             }
-            rL[i] = expf(rM_old[i] - rM[i]) * rL_old[i];
+            rL[i] = (rM_old[i] == -FLT_MAX) ? 0.0f
+                    : expf(rM_old[i] - rM[i]) * rL_old[i];
             rD[i] = 0.0f;
         }
 
