@@ -1146,6 +1146,12 @@ def test_flash_attn_kvcache(
     )
     torch.cuda.synchronize()
 
+    # Debug: show which batch/head elements are NaN
+    nan_mask = torch.isnan(flash_out)
+    if nan_mask.any():
+        print(f"[NaN DEBUG] flash_out shape={flash_out.shape}")
+        print(f"[NaN DEBUG] NaN positions (b,sq,h,d): {nan_mask.nonzero()[:20]}")
+
     metrics = _error_metrics(flash_out, ref_out)
     print(
         f"\n[kvcache] cache={cache_len} sq={seqlen_q} knew={seqlen_knew} "

@@ -8,7 +8,7 @@ export CC=gcc
 export MAX_JOBS=2
 
 pip install torch
-pip install setuptools
+pip install "setuptools<70"
 pip install ninja
 pip install wheel
 
