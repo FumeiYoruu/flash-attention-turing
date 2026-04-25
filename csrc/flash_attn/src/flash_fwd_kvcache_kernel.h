@@ -92,10 +92,10 @@ inline __device__ void compute_attn_kvcache_1rowblock(
     const int total_seqlen_k = cache_seqlen_b + seqlen_knew;  // full K context
     const int seqlen_q       = max_seqlen_q;                  // always dense (no varlen on Q for kvcache)
 
-    if (threadIdx.x == 0) {
-        printf("[ENTER] bidb=%d bidh=%d m=%d seqq=%d seqk=%d\n",
-               bidb, bidh, m_block, seqlen_q, total_seqlen_k);
-    }
+    // if (threadIdx.x == 0) {
+    //     printf("[ENTER] bidb=%d bidh=%d m=%d seqq=%d seqk=%d\n",
+    //            bidb, bidh, m_block, seqlen_q, total_seqlen_k);
+    // }
 
     if (m_block * kBlockM >= seqlen_q) { return; }
 
@@ -529,12 +529,11 @@ inline __device__ void compute_attn_kvcache_1rowblock(
     // -----------------------------------------------------------------------
     // Epilogue: normalise O, write to gmem, write LSE
     // -----------------------------------------------------------------------
-    // Debug: print rM/rL for thread 0
-    if (threadIdx.x == 0) {
-        printf("[dbg] bidb=%d bidh=%d m=%d n_max=%d seqk=%d rM0=%f rM1=%f rL0=%f rL1=%f O0=%f\n",
-               bidb, bidh, m_block, n_block_max, total_seqlen_k,
-               rM[0], rM[1], rL[0], rL[1], tOrO_float[0]);
-    }
+    // if (threadIdx.x == 0) {
+    //     printf("[dbg] bidb=%d bidh=%d m=%d n_max=%d seqk=%d rM0=%f rM1=%f rL0=%f rL1=%f O0=%f\n",
+    //            bidb, bidh, m_block, n_block_max, total_seqlen_k,
+    //            rM[0], rM[1], rL[0], rL[1], tOrO_float[0]);
+    // }
     for (int i = 0; i < 2; i++) {
         if (rL[i] != 0.0f) {
             for (int j = 0; j < tOrO_float(make_coord(_, i), _, _).size(); j++) {
