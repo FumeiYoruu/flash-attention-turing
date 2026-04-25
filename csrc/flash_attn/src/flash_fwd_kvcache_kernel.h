@@ -92,6 +92,11 @@ inline __device__ void compute_attn_kvcache_1rowblock(
     const int total_seqlen_k = cache_seqlen_b + seqlen_knew;  // full K context
     const int seqlen_q       = max_seqlen_q;                  // always dense (no varlen on Q for kvcache)
 
+    if (threadIdx.x == 0) {
+        printf("[ENTER] bidb=%d bidh=%d m=%d seqq=%d seqk=%d\n",
+               bidb, bidh, m_block, seqlen_q, total_seqlen_k);
+    }
+
     if (m_block * kBlockM >= seqlen_q) { return; }
 
     // --- Q tensor (dense, no varlen on query side) ---
